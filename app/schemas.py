@@ -6,6 +6,7 @@ Re-exports schemas from app.models for backward compatibility.
 from app.models import (
     AlertResponse,
     ComponentStatus,
+    DatabaseVerificationResponse,
     EventIngestResponse,
     EventPayload,
     EventType,
@@ -22,6 +23,7 @@ from app.models import (
 __all__ = [
     "AlertResponse",
     "ComponentStatus",
+    "DatabaseVerificationResponse",
     "EventIngestResponse",
     "EventPayload",
     "EventType",

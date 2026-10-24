@@ -245,5 +245,15 @@ class ServiceStatusResponse(BaseModel):
     security: SecurityStatus
 
 
+class DatabaseVerificationResponse(BaseModel):
+    """Documented response schema for database-only diagnostic verification."""
+
+    status: str = Field(description="Operational status: operational or error.", examples=["operational"])
+    storage_type: str = Field(description="Active database backend: postgresql or sqlite.", examples=["postgresql"])
+    verified: bool = Field(description="Whether write, read, and delete operations succeeded.", examples=[True])
+    message: str = Field(description="Sanitized diagnostic summary.", examples=["Database write, read, and cleanup verified successfully."])
+    timestamp: datetime = Field(description="UTC timestamp of the verification run.")
+
+
 # Backward-compatible alias
 SystemStatusResponse = ServiceStatusResponse

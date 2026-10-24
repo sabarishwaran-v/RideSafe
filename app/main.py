@@ -15,6 +15,7 @@ from app.config import Settings, get_settings
 from app.models import (
     AlertResponse,
     ComponentStatus,
+    DatabaseVerificationResponse,
     EventPayload,
     EventType,
     HealthResponse,
@@ -24,7 +25,7 @@ from app.models import (
     TestMessageResponse,
     TwilioStatus,
 )
-from app.storage import DatabaseError, event_store, get_event_store
+from app.storage import DatabaseError, event_store, get_event_store, verify_storage_persistence
 from app.twilio_service import twilio_service
 
 settings = get_settings()
@@ -32,10 +33,14 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager ensuring database schema initialization on startup."""
+    """Application lifespan manager ensuring database schema initialization and cleanup."""
     store = get_event_store()
     store.init_db()
-    yield
+    try:
+        yield
+    finally:
+        if hasattr(store, "close"):
+            store.close()
 
 
 app = FastAPI(
@@ -291,3 +296,27 @@ def ingest_test_event(
         notification=notification,
         message="Test event received and acknowledged. Emergency notifications are suppressed.",
     )
+
+
+@app.post(
+    f"{settings.api_prefix}/diagnostics/database",
+    response_model=DatabaseVerificationResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Diagnostics"],
+    summary="Verify database connectivity and persistence",
+    description=(
+        "Performs an authenticated, database-only write/read/delete round-trip test. "
+        "Does NOT invoke Twilio or trigger any external notifications."
+    ),
+)
+def verify_database(
+    _: Optional[str] = Depends(verify_api_key),
+) -> DatabaseVerificationResponse:
+    """Authenticate and execute safe database-only verification."""
+    result = verify_storage_persistence()
+    if not result["verified"]:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=result,
+        )
+    return DatabaseVerificationResponse(**result)

@@ -5,13 +5,17 @@ Ensures (device_id, event_id) deduplication at the database constraint level.
 Database failures are caught and surfaced without false success responses.
 """
 
+import logging
 import os
 import sqlite3
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel
 from app.config import get_settings
 from app.schemas import EventPayload, EventType
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseError(Exception):
@@ -29,6 +33,8 @@ class StoredEvent(BaseModel):
 
 class SQLiteEventStore:
     """Thread-safe SQLite persistent store with composite unique constraint deduplication."""
+
+    db_type = "sqlite"
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -212,6 +218,19 @@ class SQLiteEventStore:
         except sqlite3.Error as exc:
             raise DatabaseError(f"Database clear failure: {exc}") from exc
 
+    def delete_event(self, device_id: str, event_id: str) -> bool:
+        """Delete a single event by (device_id, event_id). Returns True if deleted."""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM events WHERE device_id = ? AND event_id = ?;",
+                    (device_id, event_id),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"Database delete failure: {exc}") from exc
+
 
 class PostgreSQLEventStore:
     """PostgreSQL-backed event store with the same interface as SQLiteEventStore."""
@@ -336,6 +355,18 @@ class PostgreSQLEventStore:
         except Exception as exc:
             raise DatabaseError("PostgreSQL clear failure.") from exc
 
+    def delete_event(self, device_id: str, event_id: str) -> bool:
+        """Delete a single event by (device_id, event_id). Returns True if deleted."""
+        try:
+            with self._pool.connection() as conn:
+                cur = conn.execute(
+                    "DELETE FROM events WHERE device_id = %s AND event_id = %s",
+                    (device_id, event_id),
+                )
+                return cur.rowcount > 0
+        except Exception as exc:
+            raise DatabaseError("PostgreSQL delete failure.") from exc
+
     def close(self) -> None:
         self._pool.close()
 
@@ -378,3 +409,74 @@ class _EventStoreProxy:
 
 # Transparent proxy export for backward compatibility
 event_store = _EventStoreProxy()
+
+
+def verify_storage_persistence(store=None) -> dict:
+    """Perform a harmless write, read, and delete verification on the active storage.
+
+    Guarantees:
+    - Never invokes Twilio or external notification services.
+    - Uses a non-emergency TEST payload with a unique transient event ID.
+    - Cleans up its own record after verification.
+    - Sanitizes errors so no SQL or connection secrets are returned.
+    """
+    target_store = store or get_event_store()
+    now = datetime.now(timezone.utc)
+    unique_id = f"diag-{uuid.uuid4().hex[:12]}"
+    test_device = "RIDESAFE_DIAGNOSTIC"
+
+    payload = EventPayload(
+        device_id=test_device,
+        event_id=unique_id,
+        event=EventType.TEST,
+        gps_valid=False,
+        timestamp=now,
+    )
+
+    was_inserted = False
+    try:
+        # 1. Verify write
+        inserted = target_store.add_event(
+            payload=payload,
+            received_at=now,
+            is_test=True,
+            is_emergency=False,
+        )
+        if not inserted:
+            raise DatabaseError("Diagnostic write was rejected as a duplicate.")
+        was_inserted = True
+
+        # 2. Verify read back
+        stored = target_store.get_event(test_device, unique_id)
+        if not stored or stored.payload.event_id != unique_id:
+            raise DatabaseError("Diagnostic read verification failed: record not found.")
+
+        # 3. Clean up test record
+        deleted = target_store.delete_event(test_device, unique_id)
+        if not deleted:
+            raise DatabaseError("Diagnostic cleanup failed: record could not be deleted.")
+        was_inserted = False
+
+        return {
+            "status": "operational",
+            "storage_type": str(getattr(target_store, "db_type", "unknown")),
+            "verified": True,
+            "message": "Database write, read, and cleanup verified successfully.",
+            "timestamp": now.isoformat(),
+        }
+    except Exception as exc:
+        logger.error("Database diagnostic verification failed: %s", type(exc).__name__)
+        return {
+            "status": "error",
+            "storage_type": str(getattr(target_store, "db_type", "unknown")),
+            "verified": False,
+            "message": "Database verification check failed.",
+            "timestamp": now.isoformat(),
+        }
+    finally:
+        # Guaranteed cleanup in finally block: only targets (test_device, unique_id)
+        if was_inserted:
+            try:
+                target_store.delete_event(test_device, unique_id)
+            except Exception as cleanup_exc:
+                logger.warning("Diagnostic cleanup in finally block failed: %s", cleanup_exc)

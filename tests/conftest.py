@@ -16,7 +16,8 @@ def isolated_test_environment(tmp_path, monkeypatch):
     temp_db_path = str(tmp_path / "test_ridesafe.db")
     monkeypatch.setenv("DATABASE_PATH", temp_db_path)
 
-    # Clear authentication and Twilio variables so tests run in a clean, predictable state
+    # Clear authentication, Twilio, and database connection strings for test isolation
+    monkeypatch.setenv("DATABASE_URL", "")
     monkeypatch.setenv("RIDESAFE_API_KEY", "")
     monkeypatch.setenv("TWILIO_ACCOUNT_SID", "")
     monkeypatch.setenv("TWILIO_AUTH_TOKEN", "")
