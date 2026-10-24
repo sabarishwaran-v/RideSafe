@@ -21,8 +21,28 @@ class Settings(BaseSettings):
     port: int = 8000
     api_prefix: str = "/api/ridesafe"
 
-    # Database Configuration (SQLite)
+    # Database Configuration: DATABASE_URL selects PostgreSQL; otherwise use SQLite.
+    database_url: Optional[str] = None
     database_path: str = "data/ridesafe.db"
+
+    @property
+    def effective_database_url(self) -> Optional[str]:
+        """Normalize managed PostgreSQL URLs and require TLS in production."""
+        if not self.database_url or not self.database_url.strip():
+            return None
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+        url = self.database_url.strip()
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"): ]
+        parts = urlsplit(url)
+        if parts.scheme not in {"postgresql", "postgres"}:
+            raise ValueError("DATABASE_URL must use the postgresql:// scheme")
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        if self.app_env.lower() == "production":
+            query = [(key, value) for key, value in query if key != "sslmode"]
+            query.append(("sslmode", "require"))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
     # Security: RideSafe Shared API Key
     ridesafe_api_key: Optional[str] = None

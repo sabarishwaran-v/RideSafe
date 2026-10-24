@@ -213,21 +213,149 @@ class SQLiteEventStore:
             raise DatabaseError(f"Database clear failure: {exc}") from exc
 
 
-_global_store: Optional[SQLiteEventStore] = None
+class PostgreSQLEventStore:
+    """PostgreSQL-backed event store with the same interface as SQLiteEventStore."""
+
+    db_type = "postgresql"
+    db_path = "managed PostgreSQL"
+
+    def __init__(self, database_url: str) -> None:
+        try:
+            from psycopg.rows import dict_row
+            from psycopg_pool import ConnectionPool
+            self._dict_row = dict_row
+            self._pool = ConnectionPool(
+                conninfo=database_url,
+                min_size=1,
+                max_size=5,
+                kwargs={"row_factory": dict_row},
+                open=True,
+            )
+            self.init_db()
+        except Exception as exc:
+            if isinstance(exc, DatabaseError):
+                raise
+            raise DatabaseError("PostgreSQL initialization failed; verify DATABASE_URL and database availability.") from exc
+
+    def init_db(self) -> None:
+        schema = """
+        CREATE TABLE IF NOT EXISTS events (
+            id BIGSERIAL PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            latitude DOUBLE PRECISION,
+            longitude DOUBLE PRECISION,
+            altitude DOUBLE PRECISION,
+            speed_kmph DOUBLE PRECISION,
+            tilt_degrees DOUBLE PRECISION,
+            gps_valid BOOLEAN NOT NULL,
+            device_timestamp TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            is_test BOOLEAN NOT NULL,
+            is_emergency BOOLEAN NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (device_id, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events (device_timestamp);
+        CREATE INDEX IF NOT EXISTS idx_events_is_emergency ON events (is_emergency);
+        """
+        try:
+            with self._pool.connection() as conn:
+                for statement in schema.split(";"):
+                    if statement.strip():
+                        conn.execute(statement)
+        except Exception as exc:
+            raise DatabaseError("PostgreSQL schema initialization failed.") from exc
+
+    def is_initialized(self) -> bool:
+        try:
+            with self._pool.connection() as conn:
+                row = conn.execute("SELECT to_regclass('public.events') AS table_name").fetchone()
+                return bool(row and row["table_name"])
+        except Exception:
+            return False
+
+    def add_event(self, payload: EventPayload, received_at: datetime, is_test: bool, is_emergency: bool) -> bool:
+        from psycopg.errors import UniqueViolation
+        sql = """INSERT INTO events (device_id,event_id,event_type,latitude,longitude,altitude,
+            speed_kmph,tilt_degrees,gps_valid,device_timestamp,received_at,is_test,is_emergency)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
+        params = (payload.device_id, payload.event_id, payload.event.value, payload.latitude,
+            payload.longitude, payload.altitude, payload.speed_kmph, payload.tilt_degrees,
+            payload.gps_valid, payload.timestamp.isoformat(), received_at.isoformat(), is_test, is_emergency)
+        try:
+            with self._pool.connection() as conn:
+                conn.execute(sql, params)
+            return True
+        except UniqueViolation:
+            return False
+        except Exception as exc:
+            raise DatabaseError("PostgreSQL write failure.") from exc
+
+    def get_event(self, device_id: str, event_id: str) -> Optional[StoredEvent]:
+        sql = """SELECT device_id,event_id,event_type,latitude,longitude,altitude,speed_kmph,
+            tilt_degrees,gps_valid,device_timestamp,received_at,is_test,is_emergency
+            FROM events WHERE device_id=%s AND event_id=%s"""
+        try:
+            with self._pool.connection() as conn:
+                row = conn.execute(sql, (device_id, event_id)).fetchone()
+            if not row:
+                return None
+            return StoredEvent(payload=EventPayload(device_id=row["device_id"], event_id=row["event_id"],
+                event=EventType(row["event_type"]), latitude=row["latitude"], longitude=row["longitude"],
+                altitude=row["altitude"], speed_kmph=row["speed_kmph"], tilt_degrees=row["tilt_degrees"],
+                gps_valid=bool(row["gps_valid"]), timestamp=datetime.fromisoformat(row["device_timestamp"])),
+                received_at=datetime.fromisoformat(row["received_at"]), is_test=bool(row["is_test"]),
+                is_emergency=bool(row["is_emergency"]))
+        except Exception as exc:
+            if isinstance(exc, DatabaseError):
+                raise
+            raise DatabaseError("PostgreSQL query failure.") from exc
+
+    def has_event(self, device_id: str, event_id: str) -> bool:
+        try:
+            with self._pool.connection() as conn:
+                row = conn.execute("SELECT 1 AS found FROM events WHERE device_id=%s AND event_id=%s LIMIT 1", (device_id, event_id)).fetchone()
+                return row is not None
+        except Exception as exc:
+            raise DatabaseError("PostgreSQL query failure.") from exc
+
+    def count(self) -> int:
+        try:
+            with self._pool.connection() as conn:
+                row = conn.execute("SELECT COUNT(*) AS total FROM events").fetchone()
+                return int(row["total"])
+        except Exception as exc:
+            raise DatabaseError("PostgreSQL count failure.") from exc
+
+    def clear(self) -> None:
+        try:
+            with self._pool.connection() as conn:
+                conn.execute("DELETE FROM events")
+        except Exception as exc:
+            raise DatabaseError("PostgreSQL clear failure.") from exc
+
+    def close(self) -> None:
+        self._pool.close()
 
 
-def get_event_store(db_path: Optional[str] = None) -> SQLiteEventStore:
-    """Retrieve the global or customized SQLiteEventStore instance."""
+_global_store = None
+
+
+def get_event_store(db_path: Optional[str] = None):
+    """Return the configured store; PostgreSQL is selected when DATABASE_URL is set."""
     global _global_store
     if db_path is not None:
         return SQLiteEventStore(db_path)
     if _global_store is None:
         settings = get_settings()
-        _global_store = SQLiteEventStore(settings.database_path)
+        database_url = settings.effective_database_url
+        _global_store = PostgreSQLEventStore(database_url) if database_url else SQLiteEventStore(settings.database_path)
     return _global_store
 
 
-def set_event_store(store: SQLiteEventStore) -> None:
+def set_event_store(store) -> None:
     """Set the active SQLiteEventStore instance."""
     global _global_store
     _global_store = store
@@ -236,6 +364,8 @@ def set_event_store(store: SQLiteEventStore) -> None:
 def reset_event_store() -> None:
     """Reset the global store instance (primarily for test teardown)."""
     global _global_store
+    if _global_store is not None and isinstance(_global_store, PostgreSQLEventStore):
+        _global_store.close()
     _global_store = None
 
 

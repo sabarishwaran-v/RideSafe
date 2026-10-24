@@ -6,6 +6,7 @@ and Twilio WhatsApp Sandbox emergency notification dispatch.
 """
 
 from contextlib import asynccontextmanager
+import secrets
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -55,11 +56,17 @@ def verify_api_key(
 ) -> Optional[str]:
     """Validate X-API-Key header against configured RIDESAFE_API_KEY.
 
-    If RIDESAFE_API_KEY is configured in the environment, all requests to protected
-    endpoints must present a matching X-API-Key header.
+    Protected endpoints require a valid key whenever configured. Production fails closed
+    if the key is missing or still a known placeholder.
     """
+    if current_settings.app_env.lower() == "production" and not current_settings.is_api_key_configured:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server authentication is not configured.",
+        )
     if current_settings.is_api_key_configured:
-        if not x_api_key or x_api_key != current_settings.ridesafe_api_key:
+        expected = current_settings.ridesafe_api_key or ""
+        if not x_api_key or not secrets.compare_digest(x_api_key, expected):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unauthorized: Missing or invalid X-API-Key header.",
@@ -140,7 +147,7 @@ def system_status(
             esp32_receiver="operational",
             whatsapp_alert_service=whatsapp_status,
             storage=StorageStatus(
-                type="sqlite",
+                type=getattr(store, "db_type", "sqlite"),
                 initialized=store.is_initialized(),
                 database_path=store.db_path,
             ),
@@ -213,7 +220,7 @@ def ingest_alert_event(
         is_test=False,
         is_emergency=True,
         received_at=received_at,
-        storage="sqlite",
+        storage=getattr(get_event_store(), "db_type", "sqlite"),
         notification=notification,
         message=(
             "Emergency alert event received and persisted for processing. "
@@ -280,7 +287,7 @@ def ingest_test_event(
         is_test=True,
         is_emergency=False,
         received_at=received_at,
-        storage="sqlite",
+        storage=getattr(get_event_store(), "db_type", "sqlite"),
         notification=notification,
         message="Test event received and acknowledged. Emergency notifications are suppressed.",
     )
